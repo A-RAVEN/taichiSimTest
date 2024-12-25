@@ -8,7 +8,7 @@ int3 = ti.types.vector(3, dtype=ti.i32)
 float3 = ti.types.vector(3, float)
 
 dimension = int3([64, 64, 64])
-gravity = float3([0, -9.8, 0])
+gravity = float3([0, -1, 0])
 
 unified_initialization=True
 
@@ -364,6 +364,7 @@ class GridField:
     field_offset: float3
     
     occupiedFieldCount=None
+    combinedFieldWeight = None
     occupiedGridPositions=None
     
     @ti.kernel
@@ -381,6 +382,7 @@ class GridField:
         self.grid_pressure_vel_resolved = float3.field(shape=self.grid_dimension)
         self.occupiedGridPositions = float3.field(shape=self.grid_dimension[0] * self.grid_dimension[1] * self.grid_dimension[2])
         self.occupiedFieldCount = ti.field(ti.i32, shape=1)
+        self.combinedFieldWeight = ti.field(ti.f32, shape=1)
         self.initialize_grids()
 
     @ti.kernel
@@ -452,6 +454,12 @@ class GridField:
             and (localpos[2] > 0.5 and localpos[2] < ti.cast(self.grid_dimension[2], float) - 0.5)
     
     @ti.func
+    def valid_grid_index(self, gridIndex:int3):
+        return (gridIndex[0] >= 0 and gridIndex[0] < self.grid_dimension[0])\
+            and (gridIndex[1] >= 0 and gridIndex[1] < self.grid_dimension[1])\
+            and (gridIndex[2] >= 0 and gridIndex[2] < self.grid_dimension[2])
+    
+    @ti.func
     def valid_world_position(self, world_pos:float3):
         return self.valid_local_position(self.worldPosToGrid(world_pos))
 
@@ -500,7 +508,7 @@ class GridField:
                 delta_pos = tm.fract(particle_localpos)
                 indexBias= float3([select(delta_pos[0] < 0.5, -1, 0), select(delta_pos[1] < 0.5, -1, 0), select(delta_pos[2] < 0.5, -1, 0)]) 
                 base_grid_f = tm.max(tm.floor(particle_localpos)+indexBias, 0)
-                #print("particle:", particle_localpos, ";base_id:", base_grid_f)
+                #print("particle:", particle_localpos, ";bacse_id:", base_grid_f)
                 base_grid_i = ti.cast(base_grid_f, ti.i32)
                 combined_del_vel = float3(0, 0, 0)
                 combined_vel = float3(0, 0, 0)
@@ -549,8 +557,11 @@ class GridField:
     @ti.kernel
     def countGrids(self):
         self.occupiedFieldCount[0] = 0
+        self.combinedFieldWeight[0] = 0
         for xx, yy, zz in ti.ndrange(self.grid_dimension[0], self.grid_dimension[1], self.grid_dimension[2]):
             if self.grids[xx, yy, zz].weight > 0.0:
+                ti.atomic_add(self.combinedFieldWeight[0], self.grids[xx, yy, zz].weight)
+            if self.grids[xx, yy, zz].weight > 0.01:
                 gridID = ti.atomic_add(self.occupiedFieldCount[0], 1)
                 gridcenter = self.gridPosToWorld(float3(xx, yy, zz) + 0.5)
                 self.occupiedGridPositions[gridID] = gridcenter
@@ -582,14 +593,14 @@ class GridField:
             self.grid_divergence[center_coord] = result_div
 
     @ti.kernel
-    def add_mass(self, center:float3, halfsize:float):
+    def add_mass(self, delta_time:float, center:float3, halfsize:float):
         for xx, yy, zz in ti.ndrange(self.grid_dimension[0], self.grid_dimension[1], self.grid_dimension[2]):
             center_coord = int3(xx, yy, zz)
             center_pos = ti.cast(center_coord, ti.f32) + 0.5
             grid_local_force_center=self.worldPosToGrid(center)
             grid_local_halfsize = halfsize / self.grid_width
             if(tm.length(grid_local_force_center - center_pos) < grid_local_halfsize):
-                self.grids[center_coord].weight = 1.0
+                self.grids[center_coord].weight += delta_time
 
 
     @ti.kernel
@@ -604,7 +615,7 @@ class GridField:
             #     self.grids[center_coord].weight = 1.0
  
             if self.grids[center_coord].weight > 0:
-                self.grids[center_coord].vel += self.worldVecToGrid(gravity) * deltatime
+                self.grids[center_coord].vel += float3(0.0, -4.0, 0.0) * deltatime
 
     @ti.func
     def sample_velocity(self, sample_coord:float3):
@@ -640,13 +651,13 @@ class GridField:
             outvels[center_coord] = self.sample_velocity(trace_back)
 
     @ti.func
-    def overlap_area(self, center1:ti.template(), halfwidth1:float, center2:ti.template(), halfwidth2:float):
-        max_min = tm.max(center1 - halfwidth1, center2 - halfwidth2)
-        min_max = tm.min(center1 + halfwidth1, center2 + halfwidth2)
+    def overlap_area(self, center1:ti.template(), center2:ti.template(), halfwidth2:float):
+        max_min = tm.max(center1 - 0.5, center2 - halfwidth2)
+        min_max = tm.min(center1 + 0.5, center2 + halfwidth2)
         result = 0.0;
         if(min_max[0] > max_min[0] and min_max[1] > max_min[1] and min_max[2] > max_min[2]):
             dist = min_max - max_min
-            result = dist[0] * dist[1] * dist[2]
+            result = dist[0] * dist[1] * dist[2] / (halfwidth2 * halfwidth2 * halfwidth2 * 8)
         return result
     
     @ti.kernel
@@ -667,32 +678,48 @@ class GridField:
             center_coord = int3(xx, yy, zz)
             center_pos = ti.cast(center_coord, ti.f32) + 0.5
             grid_vel = self.grids[center_coord].vel
+            delta_vec = grid_vel * deltaTime
+            if tm.length(delta_vec) > 2.0:
+                delta_vec *= 2.0 / tm.length(delta_vec)
             gridweight = self.grids[center_coord].weight
             if gridweight > 0.0:
-                next_pos = center_pos + deltaTime * grid_vel
-                if not self.valid_local_position(next_pos):
-                    grid_vel *= -1.0
-                    next_pos = center_pos + deltaTime * grid_vel
+                next_pos = center_pos + delta_vec
+                if not (next_pos[0] > 0.5 and next_pos[0] < ti.cast(self.grid_dimension[0], float) - 0.5):
+                    delta_vec[0] *= -1.0
+                if not (next_pos[1] > 0.5 and next_pos[1] < ti.cast(self.grid_dimension[1], float) - 0.5):
+                    delta_vec[1] *= -1.0
+                if not (next_pos[2] > 0.5 and next_pos[2] < ti.cast(self.grid_dimension[2], float) - 0.5):
+                    delta_vec[2] *= -1.0
+                next_pos = center_pos + delta_vec
+                # if not self.valid_local_position(next_pos):
+                #     delta_vec *= -1.0
+                #     next_pos = center_pos + delta_vec
                 center_pos = next_pos
-                grid_halfwidth = 0.5
+                grid_halfwidth = 0.5 * (1.0 + 0.01)# * tm.min(1.0, deltaTime * tm.length(grid_vel)))
                 grid_min = tm.clamp(ti.cast(center_pos - grid_halfwidth, ti.i32), 0, self.grid_dimension - 1)
                 grid_max = tm.clamp(ti.cast(center_pos + grid_halfwidth, ti.i32), 0, self.grid_dimension - 1)
                 grid_range = grid_max + 1 - grid_min
                 if(grid_range[0] > 0 and grid_range[1] > 0 and grid_range[2] > 0):
+                    combined_part = 0.0
                     for xi in range(grid_range[0]):
                         for yi in range(grid_range[1]):
                             for zi in range(grid_range[2]):
                                 itr_grid = grid_min + int3(xi, yi, zi)
                                 itr_grid_center = ti.cast(itr_grid, ti.f32) + 0.5
-                                overlapped_weight = self.overlap_area(itr_grid_center, 0.5, center_pos, grid_halfwidth)
-                                ti.atomic_add(outvels[itr_grid], overlapped_weight * grid_vel * gridweight)
-                                ti.atomic_add(outweights[itr_grid], overlapped_weight * gridweight)
-                            
+                                overlap_part = self.overlap_area(itr_grid_center, center_pos, grid_halfwidth)
+                                combined_part += overlap_part
+                                overlap_mass = gridweight * overlap_part
+                                ti.atomic_add(outvels[itr_grid], grid_vel * overlap_mass)
+                                ti.atomic_add(outweights[itr_grid], overlap_mass)
+                else:
+                    print("lost")
+                    # if combined_part < 1.0:
+                    #     print("reduced:",1.0 - combined_part)
+
     @ti.kernel
     def validate_vel(self):
         for xx, yy, zz in ti.ndrange(self.grid_dimension[0], self.grid_dimension[1], self.grid_dimension[2]):
             if vector_is_nan(self.grids[xx, yy, zz].vel):
-                self.grids[xx, yy, zz].vel = float3(0.0, 0.0, 0.0)
                 print("isNan")
 
     @ti.kernel
@@ -727,13 +754,12 @@ class GridField:
             self.grid_temp_vel = float3.field(shape=self.grid_dimension)
         self.grid_temp_weight.fill(0.0)
         self.grid_temp_vel.fill(float3(0, 0, 0))
-        self.sanitize_grid()
+        #self.sanitize_grid()
         #self.cleanup_temp_vel_and_weights(self.grid_temp_vel, self.grid_temp_weight)
         self.grid_forward_advect(delta_time, self.grid_temp_vel, self.grid_temp_weight)
         #self.validate_temp_vec(self.grid_temp_vel)
         self.apply_weight(self.grid_temp_weight)
         self.apply_velocity(self.grid_temp_vel)
-        #self.validate_vel()
         self.normalize_velocity()
         
 
@@ -744,10 +770,11 @@ class GridField:
             scene.particles(centers=self.occupiedGridPositions, radius=rad, index_count=self.occupiedFieldCount[0])
     @ti.func
     def weight_to_pressure(self, density:float):
-        return tm.pow(density, 7.0) - 1.0
+        return 0.04 * (tm.pow(density, 1.0) - 1.0)
 
     @ti.func
-    def pressure_weight(distance:float, h:float):
+    def pressure_weight(self, distance:float, h:float):
+        #return tm.exp(-distance * distance)
         w = tm.max(0.0, h - distance)
         return w * w * w
 
@@ -755,27 +782,43 @@ class GridField:
     def calc_sph_pressure(self, center:int3, neighbour:int3):
         dist_vec = ti.cast(center - neighbour, ti.f32)
         center_density = self.grids[center].weight
-        neighbour_density = self.grids[neighbour].weight
+
+        neighbour_density = center_density
+        if self.valid_grid_index(neighbour):
+            neighbour_density = self.grids[neighbour].weight
         center_pres = self.weight_to_pressure(center_density)
+
         neighbour_pres = self.weight_to_pressure(neighbour_density)
-        pressure_w = self.pressure_weight(tm.length(dist_vec), 1.5)
-        return (center_pres / tm.max(0.001, center_density * center_density) + neighbour_pres / tm.max(0.001, neighbour_density * neighbour_density)) * pressure_w * tm.normalize(dist_vec)
+        pressure_w = self.pressure_weight(tm.length(dist_vec), 2.0)
+        # if pressure_w > 0:
+        #     print(pressure_w)
+        prissure_val = (center_pres / tm.max(0.001, center_density * center_density) + neighbour_pres / tm.max(0.001, neighbour_density * neighbour_density)) * pressure_w * dist_vec
+        # if tm.length(prissure_val) > 0.0:
+        #     print(prissure_val)
+        return prissure_val, pressure_w
 
     @ti.kernel
-    def sph_solve(self):
+    def sph_solve(self, delta_time:float):
         for xx, yy, zz in ti.ndrange(self.grid_dimension[0], self.grid_dimension[1], self.grid_dimension[2]):
             center_coord = int3(xx, yy, zz)
-            center_pos = ti.cast(center_coord, ti.f32) + 0.5
-            grid_vel = self.grids[center_coord].vel
             gridweight = self.grids[center_coord].weight
+            combined_weight = 0.0
+            combined_pressure = float3(0.0, 0.0, 0.0)
             if gridweight > 0:
-                for xx in range(-1, 2):
-                    for yy in range(-1, 2):
-                        for zz in range(-1, 2):
-                            if not(xx==0 and yy==0 and zz==0):
-                                bias=int3(xx, yy, zz)
+                for xi in range(-1, 2):
+                    for yi in range(-1, 2):
+                        for zi in range(-1, 2):
+                            if not(xi==0 and yi==0 and zi==0):
+                                bias=int3(xi, yi, zi)
                                 neighbour_coord=center_coord+bias
-                                local_weight = self.calc_sph_pressure(center_coord, neighbour_coord)
+                                local_pressure, local_weight = self.calc_sph_pressure(center_coord, neighbour_coord)
+                                combined_weight += local_weight
+                                combined_pressure += local_pressure
+                # if combined_weight > 0:
+                #     combined_pressure /= combined_weight
+                # if(tm.length(combined_pressure) > 0):
+                #     print(combined_pressure)
+                self.grids[center_coord].vel += delta_time * combined_pressure
 
 
 particleList=ParticleGroup(1024, initcenter=float3(0.0, 0.0, 0.0), inithalfsize=float3(1.0, 1.0, 1.0))
@@ -799,7 +842,6 @@ semi_laglarian=False
 deltatime = 1.0 / 60.0
 
 #gridField.external_forces(deltatime, force_center=float3(0, 0, 0), halfsize=0.2, iniVel=float3(0.0, 0.0, 0.0))
-gridField.add_mass(center=float3(0, 0, 0), halfsize=0.5)
 use_momentun=False
 while window.running:
 
@@ -808,20 +850,26 @@ while window.running:
         gridField.insertParticles(particleList)
         gridField.normalize_velocity()
     else:
+        gridField.add_mass(deltatime * 4.0, center=float3(0, 1.0, 0), halfsize=0.1)
+        #gridField.sanitize_grid()
         gridField.external_forces(deltatime, force_center=float3(0, 0, 0), halfsize=0.2, iniVel=float3(4.0, 0.0, 0.0))
-    gridField.divergence(use_momentun)
-    possionKernel.solve_grid_pressure(gridField)
-    gridField.project_pressure(use_momentun)
+    # gridField.divergence(use_momentun)
+    # possionKernel.solve_grid_pressure(gridField)
+    # gridField.project_pressure(use_momentun)
+    gridField.sph_solve(deltatime)
     if euler_mode:
         if semi_laglarian:
             gridField.advect_semi_laglarian(deltatime)
         else:
             gridField.advect_grid_forward(deltatime)
 
-    #if not euler_mode:
-    gridField.portBackToParticles(particleList)
-    #particleList.external_forces(deltatime,  force_center=float3(0, 0, 0), halfsize=1.0, accel=float3(4.0, 0.0, 0.0))
-    particleList.tick(deltatime, gridField)
+    gridField.validate_vel()
+
+
+    if not euler_mode:
+        gridField.portBackToParticles(particleList)
+        particleList.external_forces(deltatime,  force_center=float3(0, 0, 0), halfsize=1.0, accel=float3(4.0, 0.0, 0.0))
+        particleList.tick(deltatime, gridField)
 
     camera.position(4, 5, 8)
     camera.lookat(0, 0, 0)
@@ -830,6 +878,7 @@ while window.running:
     scene.ambient_light([0.5, 0.5, 0.5])
     gridField.draw_field_range(scene)
     gridField.countAndRenderOccupiedGrids(scene)
+    print(gridField.combinedFieldWeight)
     #particleList.render(scene)
     #frameContext.next_frame()
 
